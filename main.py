@@ -5454,20 +5454,27 @@ class App(ctk.CTk):
 
             # O COMMIT dos dados ja ocorreu. Daqui em diante a operacao precisa
             # terminar o manifesto/versionamento mesmo que o usuario tente cancelar.
-            registered_versions = (
-                self.service.register_cross_table_expansion_versions(
-                    expansion_result=result,
-                    requested_by=expansion_request["requested_by"],
-                    workstation_name=socket.gethostname(),
-                    cancel_event=None,
-                    progress_callback=lambda stage_key, progress, message: self.ui(
-                        self.update_cross_table_expansion_progress,
-                        stage_key,
-                        progress,
-                        message,
-                    ),
-                    timing_report=timing_report,
-                )
+            # A resumed run whose versions were already registered (interrupted
+            # after the version batch committed) must not register them twice.
+            registered_versions = list(
+                (result.get("expansion_run") or {}).get("already_registered_versions")
+                or []
+            ) or self.service.register_cross_table_expansion_versions(
+                expansion_result=result,
+                requested_by=expansion_request["requested_by"],
+                workstation_name=socket.gethostname(),
+                cancel_event=None,
+                progress_callback=lambda stage_key, progress, message: self.ui(
+                    self.update_cross_table_expansion_progress,
+                    stage_key,
+                    progress,
+                    message,
+                ),
+                timing_report=timing_report,
+            )
+            self.service.complete_cross_table_expansion_run(
+                result,
+                timing_report=timing_report,
             )
 
             self.ui(
@@ -5542,7 +5549,11 @@ class App(ctk.CTk):
         except OperationCancelledError:
             self.ui(
                 self.mark_cross_table_expansion_cancelled,
-                "Expansion cancelled before the data was committed.",
+                (
+                    "Expansion cancelled. Blocks that were already committed are "
+                    "recorded; run Expand again with the same source, scope, and "
+                    "recipes to resume without duplicates."
+                ),
             )
             self.ui(self.set_status, "Expansion cancelled", "error")
         except Exception as exc:
@@ -5552,8 +5563,9 @@ class App(ctk.CTk):
             if was_finalizing:
                 error_message = (
                     "The data had already been committed to the destinations, but "
-                    "version finalization failed. Do not repeat the expansion "
-                    "before reconciling version history.\n\n"
+                    "version finalization failed. Run Expand again with the same "
+                    "source, scope, and recipes: the run is resumed and its "
+                    "versions are registered exactly once.\n\n"
                     f"{exc}"
                 )
             else:

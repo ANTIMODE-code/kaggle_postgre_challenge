@@ -67,6 +67,16 @@ After a successful cross-table **Expand** operation, the application displays a 
 
 Local work is measured with per-thread CPU time. Remote command work is clocked on the Linux server, and expansion statements are clocked inside PostgreSQL. SSH connection and result-return transit are therefore excluded from the measured processing total. The report can be exported as a UTF-8 `.txt` file.
 
+## Parallel, resumable Expand
+
+Expand runs the recipes in several PostgreSQL sessions over `raw_id` blocks and
+resumes after an interruption when it is started again with the same source,
+scope, and recipes. Output, validations, counters, and version history are the
+same as in the single-transaction mode. See
+[docs/PARALLEL_EXPANSION.md](./docs/PARALLEL_EXPANSION.md) for the design,
+configuration (`PDM_EXPANSION_WORKERS`, `PDM_EXPANSION_BLOCK_ROWS`,
+`PDM_EXPANSION_MODE`), and known trade-offs.
+
 ## Main dependencies
 
 - CustomTkinter

@@ -25,6 +25,7 @@ from config import (
     LEGACY_CONTROL_SCHEMA,
     REMOTE_STORAGE_DIR,
 )
+from services import parallel_expansion
 from utils import (
     format_version_history_entry,
     int_to_version,
@@ -10583,7 +10584,7 @@ WHERE raw_dump_path = {sql_literal(dump_path)};
             sql = (
                 "SELECT schemaname || '.' || tablename "
                 "FROM pg_tables "
-                f"WHERE schemaname NOT IN ('pg_catalog', 'information_schema', {sql_literal(CONTROL_SCHEMA)}, {sql_literal(LEGACY_CONTROL_SCHEMA)}) "
+                f"WHERE schemaname NOT IN ('pg_catalog', 'information_schema', {sql_literal(CONTROL_SCHEMA)}, {sql_literal(LEGACY_CONTROL_SCHEMA)}, {sql_literal(parallel_expansion.STATE_SCHEMA)}) "
                 f"AND NOT (schemaname = 'public' AND tablename = {sql_literal(DATA_TABLE_ROW_COUNTS_NAME)}) "
                 "ORDER BY schemaname, tablename;"
             )
@@ -13959,6 +13960,17 @@ SELECT json_build_object(
         )
         self._raise_if_cancelled(cancel_event)
 
+        if not parallel_expansion.single_transaction_mode():
+            return self._execute_parallel_cross_table_expansion(
+                database_name,
+                prepared,
+                source_versions,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                post_commit_callback=post_commit_callback,
+                timing_report=timing_report,
+            )
+
         with self.expansion_timing_scope(
             timing_report,
             "prepare",
@@ -14175,6 +14187,143 @@ FROM pg_temp.pgdm_expansion_timings;
             "destinations": prepared["destinations"],
             "timing_report": timing_report,
         }
+
+    def _execute_parallel_cross_table_expansion(
+        self,
+        database_name: str,
+        prepared: dict,
+        source_versions,
+        cancel_event=None,
+        progress_callback=None,
+        post_commit_callback=None,
+        timing_report: dict | None = None,
+    ) -> dict:
+        with self.expansion_timing_scope(
+            timing_report,
+            "preflight",
+            "Resolve parallel expansion sessions",
+        ):
+            workers = parallel_expansion.configured_workers()
+            if workers is None:
+                workers = parallel_expansion.automatic_workers(
+                    self,
+                    cancel_event=cancel_event,
+                )
+        with self.expansion_timing_scope(
+            timing_report,
+            "prepare",
+            "Build resumable block plan",
+        ):
+            runner = parallel_expansion.ParallelExpansionRunner(
+                self,
+                database_name,
+                prepared,
+                self._build_expansion_manifest_sql(
+                    prepared["source_schema_name"],
+                    prepared["source_table_name"],
+                    prepared["raw_schemas"],
+                ),
+                self._build_cross_table_expansion_lock_sql(prepared["destinations"]),
+                workers,
+                parallel_expansion.configured_block_rows(),
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                timing_report=timing_report,
+            )
+        with self.expansion_timing_scope(
+            timing_report,
+            "execute",
+            "Resumable expansion orchestration",
+            remote_include_in_total=False,
+        ):
+            run = runner.run()
+        if post_commit_callback:
+            post_commit_callback()
+
+        for item in run["server_timings"]:
+            diagnostic = bool(item.get("diagnostic"))
+            self._append_expansion_timing(
+                timing_report,
+                item.get("stage") or "execute",
+                item.get("name") or "PostgreSQL expansion step",
+                float(item.get("duration_seconds") or 0.0),
+                "postgresql_backend_wall",
+                rows=item.get("rows"),
+                destination=item.get("destination"),
+                details=item.get("details") or (
+                    "Measured with PostgreSQL clock_timestamp() in the server "
+                    "session; SSH transport is excluded."
+                ),
+                include_in_total=not diagnostic,
+            )
+        self._notify_progress(
+            progress_callback,
+            "execute",
+            100,
+            "Data committed to the destinations.",
+        )
+
+        manifest = run["manifest"]
+        timing_report["source_rows"] = int(manifest.get("expected_row_count") or 0)
+        timing_report["destination_rows"] = [
+            {
+                "table_name": destination["table_name"],
+                "rows": int(run["destination_rows"].get(destination["table_name"], 0)),
+            }
+            for destination in prepared["destinations"]
+        ]
+        timing_report["total_rows_inserted"] = sum(
+            item["rows"] for item in timing_report["destination_rows"]
+        )
+        timing_report["expansion_run"] = {
+            "run_id": run["run_id"],
+            "resumed": run["resumed"],
+            "workers": workers,
+            "blocks": run["block_count"],
+        }
+
+        return {
+            "source_database_name": database_name,
+            "source_schema_name": prepared["source_schema_name"],
+            "source_table_name": prepared["source_table_name"],
+            "raw_schemas": list(prepared["raw_schemas"]),
+            "source_versions": source_versions,
+            "dependency_manifest": manifest,
+            "destinations": prepared["destinations"],
+            "timing_report": timing_report,
+            "expansion_run": {
+                "run_id": run["run_id"],
+                "fingerprint": manifest["expansion_run_fingerprint"],
+                "resumed": run["resumed"],
+                "already_registered_versions": run["already_registered_versions"],
+            },
+        }
+
+    def complete_cross_table_expansion_run(
+        self,
+        expansion_result: dict,
+        timing_report: dict | None = None,
+    ):
+        run = (expansion_result or {}).get("expansion_run")
+        if not run:
+            return
+        with self.expansion_timing_scope(
+            timing_report,
+            "version",
+            "Mark resumable expansion run completed",
+        ):
+            command = (
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+                f"-d {shlex.quote(expansion_result['source_database_name'])} "
+                "-X -qAt -v ON_ERROR_STOP=1 -f -"
+            )
+            self.run_remote_command(
+                command,
+                stdin_text=parallel_expansion.complete_run_sql(
+                    run["run_id"],
+                    run["fingerprint"],
+                ),
+            )
 
     def execute_sql_script(
         self,

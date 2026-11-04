@@ -34,3 +34,6 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+# Local benchmark output
+benchmark/results/
