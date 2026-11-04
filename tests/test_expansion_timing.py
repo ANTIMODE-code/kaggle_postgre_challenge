@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch
 
@@ -125,6 +126,8 @@ class ExpansionTimingTests(unittest.TestCase):
         ]
 
         with (
+            # This test covers the original single-transaction batch.
+            patch.dict(os.environ, {"PDM_EXPANSION_MODE": "single_transaction"}),
             patch.object(service, "table_exists", return_value=True),
             patch.object(
                 service,
