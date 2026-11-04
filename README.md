@@ -75,7 +75,7 @@ scope, and recipes. Output, validations, counters, and version history are the
 same as in the single-transaction mode. See
 [docs/PARALLEL_EXPANSION.md](./docs/PARALLEL_EXPANSION.md) for the design,
 configuration (`PDM_EXPANSION_WORKERS`, `PDM_EXPANSION_BLOCK_ROWS`,
-`PDM_EXPANSION_MODE`), and known trade-offs.
+`PDM_EXPANSION_BLOCK_JOIN_HINT`, `PDM_EXPANSION_MODE`), and known trade-offs.
 
 ## Main dependencies
 

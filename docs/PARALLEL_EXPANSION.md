@@ -31,6 +31,16 @@ The new Expand (`services/parallel_expansion.py`) splits it into:
    its inserted rows to `public.pgdm_table_row_counts` and marks the block
    `done`. The block row is locked `FOR UPDATE` first, and a block that is
    already `done` does nothing, so no block can be applied twice.
+   A recipe that joins rows written earlier in the same block (here `table5`,
+   `table6` and `table2` look up `table1` by its natural key) runs with
+   `enable_hashjoin` and `enable_mergejoin` off, set with `set_config(..., true)`
+   for that statement only and restored afterwards. Without it, once
+   autovacuum analyzes the growing destination tables mid-run, the planner
+   switches to hash joins that read the whole of `table1` or hash wide JSON rows
+   for every block, and spill to temporary files (3M rows, 24 blocks: 4.4 GB of
+   temporary files without the setting, 63 MB with it; 10M rows on PostgreSQL
+   18: 18.3 GB before the fix). The index lookups it forces use the existing
+   unique indexes, so no index is added.
 3. **Finalization transaction**: every block must be `done` and the source
    manifest is computed again and must equal the one stored at plan time. Any
    change to the source during the run fails the expansion.
@@ -82,6 +92,7 @@ exactly one version per destination, and no open run.
 |---|---|---|
 | `PDM_EXPANSION_WORKERS` | CPUs of the Linux server (`nproc`), max 8 | parallel PostgreSQL sessions |
 | `PDM_EXPANSION_BLOCK_ROWS` | `500000` | maximum source rows per block (resume granularity) |
+| `PDM_EXPANSION_BLOCK_JOIN_HINT` | `on` | `off` lets the planner choose join methods freely inside blocks (use it only if a custom recipe joins a block table without a usable index) |
 | `PDM_EXPANSION_MODE` | parallel | `single_transaction` runs the original one-transaction Expand |
 
 Objects added to the data database: schema `pgdm_expansion` with tables
