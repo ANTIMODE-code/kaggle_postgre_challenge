@@ -87,6 +87,24 @@ class ParallelExpansionTests(unittest.TestCase):
         for _file_name, table_name in RECIPE_DESTINATIONS[2:]:
             self.assertIn(f"INSERT INTO {table_name}", sql)
 
+    def test_joins_to_rows_of_the_same_block_use_nested_loops(self):
+        runner = build_runner(prepare_official_recipes())
+        sql = runner._block_sql(
+            7,
+            {"block_number": 3, "raw_id_from": 1, "raw_id_to": 100},
+        )
+
+        def join_settings_before(table_name):
+            head = sql[: sql.index(f"INSERT INTO {table_name}")]
+            return head[head.rindex("PERFORM set_config('enable_hashjoin'"):]
+
+        # table1 only joins the whole-source dimension table3: planner default.
+        self.assertIn("pgdm_enable_hashjoin", join_settings_before("public.table1"))
+        for table_name in ("public.table5", "public.table6", "public.table2"):
+            settings = join_settings_before(table_name)
+            self.assertIn("'enable_hashjoin', 'off', true", settings)
+            self.assertIn("'enable_mergejoin', 'off', true", settings)
+
     def test_aggregate_after_per_row_destination_is_rejected(self):
         prepared = prepare_official_recipes()
         prepared["destinations"] = [

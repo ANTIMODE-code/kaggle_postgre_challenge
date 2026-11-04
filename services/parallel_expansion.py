@@ -59,6 +59,11 @@ def configured_workers() -> int | None:
     return workers
 
 
+def block_join_hint_enabled() -> bool:
+    """PDM_EXPANSION_BLOCK_JOIN_HINT=off lets the planner choose freely in blocks."""
+    return str(os.getenv("PDM_EXPANSION_BLOCK_JOIN_HINT") or "on").strip().lower() != "off"
+
+
 def configured_block_rows() -> int:
     value = str(os.getenv("PDM_EXPANSION_BLOCK_ROWS") or "").strip()
     block_rows = int(value) if value else DEFAULT_BLOCK_ROWS
@@ -509,10 +514,31 @@ WHERE run_id = currval(pg_get_serial_sequence({sql_literal(RUNS_TABLE)}, 'run_id
         counters = []
         rows_json = []
         variable_index = 0
+        block_relations = set()
         for destination in self.per_block:
             variable = f"pgdm_rows_{variable_index}"
             variable_index += 1
             pieces = []
+            reads_block_rows = block_join_hint_enabled() and any(
+                tuple(relation) in block_relations
+                for relation in destination.get("read_relations") or []
+            )
+            # Rows written earlier in this block (table1 for table5, table6 and
+            # table2) are joined back by raw_id. With table-wide statistics the
+            # planner hashes the whole destination, or the block's wide JSONB rows,
+            # once per block: a full scan of the destination per block and, past
+            # work_mem, temporary files. A nested loop over the destination's
+            # raw_id index touches only this block's rows. Only the join method
+            # changes, never the statement or its result.
+            pieces.append(
+                "\n    PERFORM set_config('enable_hashjoin', "
+                + ("'off'" if reads_block_rows else "pgdm_enable_hashjoin")
+                + ", true);"
+                + "\n    PERFORM set_config('enable_mergejoin', "
+                + ("'off'" if reads_block_rows else "pgdm_enable_mergejoin")
+                + ", true);"
+            )
+            block_relations.add((destination["schema_name"], destination["pure_table_name"]))
             for statement in destination["statements"]:
                 pieces.append(
                     f"""
@@ -544,7 +570,9 @@ DO {tag}
 DECLARE
     pgdm_affected_rows bigint;
     pgdm_block_status text;
-    pgdm_block_started_at timestamptz := clock_timestamp();{declarations}
+    pgdm_block_started_at timestamptz := clock_timestamp();
+    pgdm_enable_hashjoin text := current_setting('enable_hashjoin');
+    pgdm_enable_mergejoin text := current_setting('enable_mergejoin');{declarations}
 BEGIN
     SELECT status INTO pgdm_block_status
     FROM {BLOCKS_TABLE}
