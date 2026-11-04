@@ -417,9 +417,11 @@ DROP TABLE pg_temp.pgdm_expansion_timings;
         destination_names = [item["table_name"] for item in self.prepared["destinations"]]
         destination_array = "ARRAY[" + ", ".join(sql_literal(v) for v in destination_names) + "]::text[]"
         scope_array = "ARRAY[" + self._scope_sql() + "]::text[]"
+        # A multiple of the session count, so the last round of blocks does not
+        # leave sessions idle while one large block finishes.
         block_count_sql = (
-            f"GREATEST({int(self.workers)}, CEIL((SELECT SUM(row_count) FROM "
-            f"{MANIFEST_TEMP_TABLE})::numeric / {int(self.block_rows)})::integer)"
+            f"(CEIL(CEIL((SELECT SUM(row_count) FROM {MANIFEST_TEMP_TABLE})::numeric "
+            f"/ {int(self.block_rows)}) / {int(self.workers)}) * {int(self.workers)})::integer"
         )
         sql = "\n\n".join(
             [

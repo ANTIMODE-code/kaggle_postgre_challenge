@@ -21,8 +21,8 @@ The new Expand (`services/parallel_expansion.py`) splits it into:
    (any recipe with `DISTINCT`, aggregates, window functions, set operations,
    `LIMIT`, or more than one read of `{{source}}`; here `table3` and `table4`),
    and splits the source rows of the selected scope into `raw_id` blocks of
-   equal size with `NTILE` (at least one per session, at most
-   `PDM_EXPANSION_BLOCK_ROWS` rows each). All of this commits together.
+   equal size with `NTILE` (a multiple of the session count, at most
+   `PDM_EXPANSION_BLOCK_ROWS` rows each, so every round keeps all sessions busy). All of this commits together.
 2. **Block transactions**, executed by up to `PDM_EXPANSION_WORKERS` sessions at
    once. Each block runs the remaining recipes (`table1`, `table5`, `table6`,
    `table2`) with `{{source}}` narrowed to its range: the protected subquery
@@ -49,17 +49,32 @@ identified by a SHA-256 fingerprint of source, scope and prepared recipes:
 
 | Interrupted during | State left | What the next Expand does |
 |---|---|---|
-| Preflight or plan transaction | nothing (rolled back) | starts a new run |
+| Preflight, or plan transaction aborted on the server | nothing (rolled back) | starts a new run |
 | Block phase | committed blocks are `done`, the rest `pending` | runs only the pending blocks |
 | Finalization | all blocks `done` | re-validates and finalizes |
 | Between version batch and run completion | versions registered | finds the versions by run id, does not register them again, completes the run |
 
+Closing or killing the Windows client does not necessarily stop the work:
+each `psql` on the Linux server has already received its whole batch and may
+finish it. That is safe: a batch that finishes commits a complete plan or a
+complete block, a batch that is aborted on the server rolls back, and the next
+Expand picks up whatever is still pending.
+
 Only one run can be open per database (unique partial index). If an open run
 has a different fingerprint, Expand stops and asks to resume that run first,
-so partial data from two different expansions can never mix. A killed client
-cannot leave a block half applied: each block is one transaction, and on
-PostgreSQL 14+ the block sessions set `client_connection_check_interval` so a
-server backend whose client disappeared aborts within a second.
+so partial data from two different expansions can never mix. No interruption
+can leave a block half applied, because each block is one transaction. On
+PostgreSQL 14+ the block sessions also set `client_connection_check_interval`,
+so a backend whose `psql` disappeared aborts within a second instead of
+holding its block lock.
+
+Tested interruptions (1M rows, `resume_test.py`): client SIGKILL during the
+plan and during the blocks, process exit right after the plan commit and right
+after the version batch, user cancel during the blocks, and
+`pg_terminate_backend` of the plan session and of all block sessions. After
+each, a normal Expand finished the run with output checksums identical to the
+uninterrupted single-transaction Expand, row counters equal to `COUNT(*)`,
+exactly one version per destination, and no open run.
 
 ## Configuration
 
